@@ -120,7 +120,7 @@ client.on('messageCreate', async (message) => {
             }
 
             // Assign "Verified" role
-            const role = message.guild.roles.cache.find(r => r.name === 'Verified');
+            const role = message.guild.roles.cache.find(r => r.name === 'Citzen');
             if (!role) return message.reply('❌ Could not find a role named "Verified". Please create one.');
 
             const member = message.guild.members.cache.get(message.author.id);
