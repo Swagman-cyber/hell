@@ -4,33 +4,25 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const express = require('express');
 
-// --- Database Setup ---
+// === Express for uptime ===
+const app = express();
+app.get('/', (req, res) => res.send('Bot is running!'));
+app.listen(3000, () => console.log('🌐 Web server running.'));
+
+// === SQLite Setup ===
 const db = new sqlite3.Database('./usedCodes.db', (err) => {
   if (err) {
-    console.error('❌ Error opening database:', err.message);
-  } else {
-    console.log('📦 Database connected');
-    db.run('CREATE TABLE IF NOT EXISTS usedCodes (code TEXT PRIMARY KEY)', (err) => {
-      if (err) console.error('❌ Error creating table:', err.message);
-    });
+    console.error('Database error:', err.message);
+    process.exit(1);
   }
+  console.log('✅ Database connected');
+  db.run(`CREATE TABLE IF NOT EXISTS usedCodes (code TEXT PRIMARY KEY, robloxId TEXT)`);
+  db.run(`CREATE TABLE IF NOT EXISTS verifiedRoles (guildId TEXT, roleId TEXT, PRIMARY KEY (guildId, roleId))`);
 });
 
-// --- Web Server (Uptime Ping) ---
-const app = express();
-const port = 3000;
-app.get('/', (req, res) => res.send('✅ AvatarCheck is running!'));
-app.listen(port, '0.0.0.0', () => {
-  console.log(`🌐 Uptime server active on http://0.0.0.0:${port}`);
-});
-
-// --- Discord Client Setup ---
+// === Bot Setup ===
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
   partials: [Partials.Channel],
 });
 
@@ -40,49 +32,80 @@ function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// --- Bot Ready ---
-client.once('ready', async () => {
+// === On Ready ===
+client.once('ready', () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
 });
 
-// --- Message Listener ---
+// === Message Handler ===
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const args = message.content.trim().split(/\s+/);
   const command = args[0].toLowerCase();
 
-  // Step 1: !verify <username>
+  // === !optinrole @Role ===
+  if (command === '!optinrole') {
+    if (!message.member.permissions.has('Administrator')) return message.reply('❌ Only admins can use this.');
+
+    const roleId = args[1]?.match(/\d+/)?.[0];
+    const role = message.guild.roles.cache.get(roleId);
+    if (!role) return message.reply('❗ Usage: `!optinrole @Role`');
+
+    db.run(`INSERT OR IGNORE INTO verifiedRoles (guildId, roleId) VALUES (?, ?)`, [message.guild.id, role.id], (err) => {
+      if (err) {
+        console.error(err);
+        return message.reply('❌ Error saving role.');
+      }
+      message.reply(`✅ **${role.name}** is now a verified role.`);
+    });
+  }
+
+  // === !optoutrole @Role ===
+  if (command === '!optoutrole') {
+    if (!message.member.permissions.has('Administrator')) return message.reply('❌ Only admins can use this.');
+
+    const roleId = args[1]?.match(/\d+/)?.[0];
+    const role = message.guild.roles.cache.get(roleId);
+    if (!role) return message.reply('❗ Usage: `!optoutrole @Role`');
+
+    db.run(`DELETE FROM verifiedRoles WHERE guildId = ? AND roleId = ?`, [message.guild.id, role.id], (err) => {
+      if (err) {
+        console.error(err);
+        return message.reply('❌ Error removing role.');
+      }
+      message.reply(`✅ **${role.name}** is no longer a verified role.`);
+    });
+  }
+
+  // === !verify <username> ===
   if (command === '!verify') {
-    const robloxUsername = args[1];
-    if (!robloxUsername) {
-      return message.reply('❗ Please use: `!verify <robloxUsername>`');
-    }
+    const username = args[1];
+    if (!username) return message.reply('❗ Usage: `!verify <RobloxUsername>`');
 
     try {
       const res = await axios.post('https://users.roblox.com/v1/usernames/users', {
-        usernames: [robloxUsername],
-        excludeBannedUsers: true,
+        usernames: [username],
+        excludeBannedUsers: true
       });
 
       const userData = res.data.data[0];
-      if (!userData) return message.reply('❌ Roblox user not found.');
+      if (!userData) return message.reply('❌ User not found.');
 
       const robloxId = userData.id;
       const code = generateCode();
-
       pendingVerifications.set(message.author.id, { robloxId, code });
 
-      return message.reply(
-        `📋 Add this code to your **Roblox About Me**:\n\`\`\`${code}\`\`\`\nThen type \`!confirm\` to complete verification.`
+      message.reply(
+        `✅ Paste this code into your **Roblox About Me**:\n\`\`\`${code}\`\`\`\nThen type \`!confirm\` when you're done.`
       );
-    } catch (error) {
-      console.error(error);
-      return message.reply('❌ Failed to fetch Roblox user info.');
+    } catch (err) {
+      console.error(err);
+      message.reply('❌ Failed to look up Roblox username.');
     }
   }
 
-  // Step 2: !confirm
+  // === !confirm ===
   if (command === '!confirm') {
     const entry = pendingVerifications.get(message.author.id);
     if (!entry) return message.reply('❗ Use `!verify <username>` first.');
@@ -92,50 +115,59 @@ client.on('messageCreate', async (message) => {
       const description = profile.data.description || '';
 
       if (!description.includes(entry.code)) {
-        return message.reply('❌ Verification code not found in your Roblox profile.');
+        return message.reply('❌ Code not found in your Roblox About Me.');
       }
 
-      db.get('SELECT * FROM usedCodes WHERE code = ?', [entry.code], (err, row) => {
+      db.get('SELECT * FROM usedCodes WHERE code = ? AND robloxId = ?', [entry.code, entry.robloxId], (err, row) => {
         if (err) {
-          console.error('DB Error:', err);
-          return message.reply('❌ Internal DB error.');
+          console.error(err);
+          return message.reply('❌ DB error.');
         }
 
         if (row) {
-          return message.reply('❌ This verification code has already been used.');
+          return message.reply('❌ This code has already been used.');
         }
 
-        db.run('INSERT INTO usedCodes (code) VALUES (?)', [entry.code], (err) => {
+        db.run('INSERT INTO usedCodes (code, robloxId) VALUES (?, ?)', [entry.code, entry.robloxId], (err) => {
           if (err) {
-            console.error('DB Insert Error:', err);
-            return message.reply('❌ Failed to save verification code.');
+            console.error(err);
+            return message.reply('❌ DB error saving code.');
           }
 
-          const verifiedRole = message.guild.roles.cache.find(r => r.name === 'Verified');
-          const member = message.guild.members.cache.get(message.author.id);
+          // Assign one of the allowed roles
+          db.all('SELECT roleId FROM verifiedRoles WHERE guildId = ?', [message.guild.id], async (err, rows) => {
+            if (err || rows.length === 0) {
+              return message.reply('❗ No verified roles are set up. Ask an admin to run `!optinrole @Role`');
+            }
 
-          if (!verifiedRole) {
-            return message.reply('❌ Role "Verified" not found. Please ask an admin to create it.');
-          }
+            const member = message.guild.members.cache.get(message.author.id);
+            let success = false;
 
-          if (!member) {
-            return message.reply('❌ Could not find your server membership.');
-          }
+            for (const row of rows) {
+              const role = message.guild.roles.cache.get(row.roleId);
+              if (role) {
+                try {
+                  await member.roles.add(role);
+                  success = true;
+                  break;
+                } catch (err) {
+                  console.error('Role assignment error:', err);
+                }
+              }
+            }
 
-          member.roles.add(verifiedRole)
-            .then(() => {
+            if (success) {
               pendingVerifications.delete(message.author.id);
-              message.reply('✅ Verification complete! You have been given the **Verified** role.');
-            })
-            .catch((err) => {
-              console.error('Role Assignment Error:', err);
-              message.reply('❌ Failed to assign the Verified role.');
-            });
+              return message.reply('🎉 You are now verified!');
+            } else {
+              return message.reply('❌ Could not assign any verified roles. Make sure the bot has permission.');
+            }
+          });
         });
       });
     } catch (err) {
-      console.error('Verification Error:', err);
-      return message.reply('❌ Failed to verify your Roblox account.');
+      console.error(err);
+      message.reply('❌ Error while checking your Roblox profile.');
     }
   }
 });
