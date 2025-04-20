@@ -11,18 +11,31 @@ const db = new sqlite3.Database('./usedCodes.db', (err) => {
   } else {
     console.log('Database connected');
 
-    // Ensure the correct table structure is in place
-    db.run(`
-      CREATE TABLE IF NOT EXISTS usedCodes (
-        code TEXT PRIMARY KEY,
-        robloxId TEXT
-      )`, (err) => {
+    // Check and fix table schema if needed
+    db.serialize(() => {
+      // Check if the table exists and if columns are correct
+      db.all("PRAGMA table_info(usedCodes);", (err, rows) => {
         if (err) {
-          console.error('❌ Error creating table:', err);
+          console.error("❌ Error getting table info:", err);
+          return;
+        }
+
+        // If the table is missing or doesn't have 'robloxId', recreate it
+        if (!rows.length || !rows.some(row => row.name === 'robloxId')) {
+          console.log('❌ Invalid table structure. Recreating the table...');
+          db.run('DROP TABLE IF EXISTS usedCodes');
+          db.run('CREATE TABLE usedCodes (code TEXT PRIMARY KEY, robloxId TEXT)', (err) => {
+            if (err) {
+              console.error('❌ Error creating usedCodes table:', err);
+            } else {
+              console.log('✅ usedCodes table recreated with the correct schema.');
+            }
+          });
         } else {
-          console.log('✅ usedCodes table created or exists.');
+          console.log('✅ usedCodes table is valid.');
         }
       });
+    });
   }
 });
 
@@ -130,7 +143,7 @@ client.on('messageCreate', async (message) => {
               return message.reply('❌ Error storing code in the database.');
             }
 
-            // Assign the "Citzen" role
+            // Assign the "Citizen" role
             const guild = message.guild;
             const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'citizen');
 
