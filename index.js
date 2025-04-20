@@ -10,32 +10,7 @@ const db = new sqlite3.Database('./usedCodes.db', (err) => {
     process.exit(1);
   } else {
     console.log('Database connected');
-
-    // Check and fix table schema if needed
-    db.serialize(() => {
-      // Check if the table exists and if columns are correct
-      db.all("PRAGMA table_info(usedCodes);", (err, rows) => {
-        if (err) {
-          console.error("❌ Error getting table info:", err);
-          return;
-        }
-
-        // If the table is missing or doesn't have 'robloxId', recreate it
-        if (!rows.length || !rows.some(row => row.name === 'robloxId')) {
-          console.log('❌ Invalid table structure. Recreating the table...');
-          db.run('DROP TABLE IF EXISTS usedCodes');
-          db.run('CREATE TABLE usedCodes (code TEXT PRIMARY KEY, robloxId TEXT)', (err) => {
-            if (err) {
-              console.error('❌ Error creating usedCodes table:', err);
-            } else {
-              console.log('✅ usedCodes table recreated with the correct schema.');
-            }
-          });
-        } else {
-          console.log('✅ usedCodes table is valid.');
-        }
-      });
-    });
+    db.run('CREATE TABLE IF NOT EXISTS usedCodes (code TEXT PRIMARY KEY, robloxId TEXT)');
   }
 });
 
@@ -128,7 +103,7 @@ client.on('messageCreate', async (message) => {
         // Check if the code has already been used in the database
         db.get('SELECT * FROM usedCodes WHERE code = ? AND robloxId = ?', [entry.code, entry.robloxId], (err, row) => {
           if (err) {
-            console.error('❌ DB lookup error:', err);
+            console.error(err);
             return message.reply('❌ Error checking code in the database.');
           }
 
@@ -139,16 +114,21 @@ client.on('messageCreate', async (message) => {
           // Add the code to the usedCodes table to prevent reuse
           db.run('INSERT INTO usedCodes (code, robloxId) VALUES (?, ?)', [entry.code, entry.robloxId], (err) => {
             if (err) {
-              console.error('❌ DB insert error:', err);
+              console.error(err);
               return message.reply('❌ Error storing code in the database.');
             }
 
-            // Assign the "Citizen" role
+            // Assign the "Citizen" role and remove "Guest"
             const guild = message.guild;
-            const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'citizen');
+            const citizenRole = guild.roles.cache.find(r => r.name.toLowerCase() === 'citizen');
+            const guestRole = guild.roles.cache.find(r => r.name.toLowerCase() === 'guest');
 
-            if (!role) {
+            if (!citizenRole) {
               return message.reply('❌ The "Citizen" role does not exist in the server. Please create it.');
+            }
+
+            if (!guestRole) {
+              return message.reply('❌ The "Guest" role does not exist in the server. Please create it.');
             }
 
             const member = guild.members.cache.get(message.author.id);
@@ -156,14 +136,18 @@ client.on('messageCreate', async (message) => {
               return message.reply('❌ Failed to find your Discord account in the server.');
             }
 
-            member.roles.add(role)
+            // Remove the "Guest" role and add the "Citizen" role
+            member.roles.remove(guestRole)
+              .then(() => {
+                return member.roles.add(citizenRole);
+              })
               .then(() => {
                 pendingVerifications.delete(message.author.id); // Invalidate the code
-                message.reply('🎉 You are now verified and have been given the **Citizen** role!');
+                message.reply('🎉 You are now verified and have been given the **Citizen** role! The "Guest" role has been removed.');
               })
               .catch((err) => {
                 console.error(err);
-                message.reply('❌ Failed to assign role.');
+                message.reply('❌ Failed to assign role or remove the "Guest" role.');
               });
           });
         });
@@ -171,7 +155,7 @@ client.on('messageCreate', async (message) => {
         return message.reply('❌ Verification code not found in your profile. Double-check your About Me.');
       }
     } catch (err) {
-      console.error('❌ Error while checking your Roblox profile:', err);
+      console.error(err);
       return message.reply('❌ Error while checking your Roblox profile.');
     }
   }
