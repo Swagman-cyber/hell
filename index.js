@@ -122,6 +122,7 @@ client.on('messageCreate', async (message) => {
     try {
       const profile = await axios.get(`https://users.roblox.com/v1/users/${entry.robloxId}`);
       const description = profile.data.description || '';
+      const robloxImage = `https://www.roblox.com/headshot-thumbnail/image?userId=${entry.robloxId}&width=420&height=420&format=png`;
 
       // Check if the verification code exists in the About Me
       if (description.includes(entry.code)) {
@@ -159,7 +160,17 @@ client.on('messageCreate', async (message) => {
             member.roles.add(role)
               .then(() => {
                 pendingVerifications.delete(message.author.id); // Invalidate the code
-                message.reply('🎉 You are now verified and have been given the **Citizen** role!');
+                message.reply({
+                  content: `🎉 You are now verified and have been given the **Citizen** role!`,
+                  embeds: [
+                    {
+                      title: `Roblox Profile`,
+                      description: `Welcome to the Kingdom! You're now verified as a **Citizen**.`,
+                      image: { url: robloxImage },
+                      color: 0x00ff00
+                    }
+                  ]
+                });
               })
               .catch((err) => {
                 console.error(err);
