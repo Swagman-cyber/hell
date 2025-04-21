@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 
@@ -12,6 +12,7 @@ const db = new sqlite3.Database('./usedCodes.db', (err) => {
     console.log('Database connected');
     // Check and fix table schema if needed
     db.serialize(() => {
+      // Check if the table exists and if columns are correct
       db.all("PRAGMA table_info(usedCodes);", (err, rows) => {
         if (err) {
           console.error("❌ Error getting table info:", err);
@@ -66,8 +67,7 @@ function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Registering Slash Commands
-client.on('ready', async () => {
+client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   const guild = await client.guilds.fetch(process.env.GUILD_ID);
@@ -77,28 +77,23 @@ client.on('ready', async () => {
   }
 
   console.log(`📌 Connected to guild: ${guild.name}`);
-
-  // Register Slash Commands
-  const commands = [
-    new SlashCommandBuilder().setName('verify').setDescription('Start the Roblox account verification process'),
-    new SlashCommandBuilder().setName('confirm').setDescription('Confirm your Roblox account verification'),
-  ];
-
-  await client.application.commands.set(commands, process.env.GUILD_ID); // Register commands for your guild
-  console.log('✅ Slash commands registered');
 });
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isCommand()) return;
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !message.guild) return;
 
-  if (interaction.commandName === 'verify') {
+  const args = message.content.trim().split(/\s+/);
+  const command = args[0].toLowerCase();
+
+  // Step 1: !verify <username>
+  if (command === '!verify') {
     if (!verificationEnabled) {
-      return interaction.reply('❌ Verification is currently disabled.');
+      return message.reply('❌ Verification is currently disabled.');
     }
 
-    const robloxUsername = interaction.options.getString('username');
+    const robloxUsername = args[1];
     if (!robloxUsername) {
-      return interaction.reply('❗ Please provide your Roblox username. Usage: `/verify <username>`');
+      return message.reply('❗ Please provide your Roblox username. Usage: !verify <username>');
     }
 
     try {
@@ -108,87 +103,133 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       const userData = res.data.data[0];
-      if (!userData) return interaction.reply('❌ Roblox user not found.');
+      if (!userData) return message.reply('❌ Roblox user not found.');
 
       const robloxId = userData.id;
       const robloxProfileUrl = `https://www.roblox.com/users/${robloxId}/profile`;
       const profileImageUrl = `https://www.roblox.com/headshot-thumbnail/image?userId=${robloxId}&width=420&height=420&format=png`;
       const code = generateCode();
 
-      pendingVerifications.set(interaction.user.id, { robloxId, code });
+      pendingVerifications.set(message.author.id, { robloxId, code });
 
-      const embed = {
-        title: 'Roblox Verification',
-        description: `✅ **Paste this code into your Roblox About Me:**\n\`\`\`${code}\`\`\`\nThen type \`/confirm\` when you're done.`,
-        color: 0x00FF00,
-        thumbnail: { url: profileImageUrl },
-        url: robloxProfileUrl
-      };
+      // Send instructions with rich embed and profile image
+      const embed = new EmbedBuilder()
+        .setTitle('Roblox Verification')
+        .setDescription(`✅ **Paste this code into your Roblox About Me:**\n\`${code}\`\nThen type \`!confirm\` when you're done.`)
+        .setColor('Green')
+        .setThumbnail(profileImageUrl)
+        .setURL(robloxProfileUrl);
 
-      return interaction.reply({ embeds: [embed] });
+      return message.reply({ embeds: [embed] });
 
     } catch (error) {
       console.error(error);
-      return interaction.reply('❌ Failed to fetch Roblox user info.');
+      return message.reply('❌ Failed to fetch Roblox user info.');
     }
   }
 
-  if (interaction.commandName === 'confirm') {
-    const entry = pendingVerifications.get(interaction.user.id);
-    if (!entry) return interaction.reply('❗ You need to use `/verify <username>` first.');
+  // Step 2: !confirm
+  if (command === '!confirm') {
+    const entry = pendingVerifications.get(message.author.id);
+    if (!entry) return message.reply('❗ You need to use !verify <username> first.');
 
     try {
       const profile = await axios.get(`https://users.roblox.com/v1/users/${entry.robloxId}`);
       const description = profile.data.description || '';
 
+      // Check if the verification code exists in the About Me
       if (description.includes(entry.code)) {
+        // Check if the code has already been used in the database
         db.get('SELECT * FROM usedCodes WHERE code = ? AND robloxId = ?', [entry.code, entry.robloxId], (err, row) => {
           if (err) {
             console.error('❌ DB lookup error:', err);
-            return interaction.reply('❌ Error checking code in the database.');
+            return message.reply('❌ Error checking code in the database.');
           }
 
           if (row) {
-            return interaction.reply('❌ This code has already been used or is invalid.');
+            return message.reply('❌ This code has already been used or is invalid.');
           }
 
+          // Add the code to the usedCodes table to prevent reuse
           db.run('INSERT INTO usedCodes (code, robloxId) VALUES (?, ?)', [entry.code, entry.robloxId], (err) => {
             if (err) {
               console.error('❌ DB insert error:', err);
-              return interaction.reply('❌ Error storing code in the database.');
+              return message.reply('❌ Error storing code in the database.');
             }
 
             // Assign the "Citizen" role
-            const guild = interaction.guild;
+            const guild = message.guild;
             const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'citizen');
 
             if (!role) {
-              return interaction.reply('❌ The "Citizen" role does not exist in the server. Please create it.');
+              return message.reply('❌ The "Citizen" role does not exist in the server. Please create it.');
             }
 
-            const member = guild.members.cache.get(interaction.user.id);
+            const member = guild.members.cache.get(message.author.id);
             if (!member) {
-              return interaction.reply('❌ Failed to find your Discord account in the server.');
+              return message.reply('❌ Failed to find your Discord account in the server.');
             }
 
             member.roles.add(role)
               .then(() => {
-                pendingVerifications.delete(interaction.user.id); // Invalidate the code
-                interaction.reply('🎉 You are now verified and have been given the **Citizen** role!');
+                pendingVerifications.delete(message.author.id); // Invalidate the code
+
+                // Fetch the profile image and send it in the confirmation message
+                const profileImageUrl = `https://www.roblox.com/headshot-thumbnail/image?userId=${entry.robloxId}&width=420&height=420&format=png`;
+
+                const embed = new EmbedBuilder()
+                  .setTitle('🎉 Verification Complete!')
+                  .setDescription('You have successfully verified your Roblox account and been given the **Citizen** role!')
+                  .setColor('Green')
+                  .setThumbnail(profileImageUrl)
+                  .setFooter({ text: 'Verification completed' });
+
+                message.reply({ embeds: [embed] });
               })
               .catch((err) => {
                 console.error(err);
-                interaction.reply('❌ Failed to assign role.');
+                message.reply('❌ Failed to assign role.');
               });
           });
         });
       } else {
-        return interaction.reply('❌ Verification code not found in your profile. Double-check your About Me.');
+        return message.reply('❌ Verification code not found in your profile. Double-check your About Me.');
       }
     } catch (err) {
       console.error('❌ Error while checking your Roblox profile:', err);
-      return interaction.reply('❌ Error while checking your Roblox profile.');
+      return message.reply('❌ Error while checking your Roblox profile.');
     }
+  }
+
+  // Admin Commands
+  if (command === '!settings' && message.member.permissions.has('ADMINISTRATOR')) {
+    // Display current settings
+    const embed = new EmbedBuilder()
+      .setTitle('Verification Settings')
+      .setDescription(`**Verification Enabled:** ${verificationEnabled ? 'Enabled' : 'Disabled'}`)
+      .setColor('Blue');
+
+    message.reply({ embeds: [embed] });
+  }
+
+  // Admin Command to Disable/Enable Verification
+  if (command === '!disableverification' && message.member.permissions.has('ADMINISTRATOR')) {
+    verificationEnabled = !verificationEnabled;
+    message.reply(`✅ Verification has been ${verificationEnabled ? 'enabled' : 'disabled'}.`);
+  }
+
+  // Admin Command to Set Verification Role
+  if (command === '!setverrole' && message.member.permissions.has('ADMINISTRATOR')) {
+    const roleName = args.slice(1).join(' ');
+    if (!roleName) return message.reply('❗ Please provide the role name.');
+
+    const guild = message.guild;
+    const role = guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+
+    if (!role) return message.reply('❌ The specified role does not exist.');
+
+    // Optionally, save this role for future use (not implemented here)
+    message.reply(`✅ Verification role set to **${roleName}**.`);
   }
 });
 
