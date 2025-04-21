@@ -2,33 +2,52 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
-const fs = require('fs');
 
 // Setup SQLite database
-const db = new sqlite3.Database('./serverSettings.db', (err) => {
+const db = new sqlite3.Database('./usedCodes.db', (err) => {
   if (err) {
     console.error('Error opening database:', err.message);
     process.exit(1);
   } else {
     console.log('Database connected');
-    // Ensure serverSettings table exists
-    db.run(`
-      CREATE TABLE IF NOT EXISTS serverSettings (
-        guildId TEXT PRIMARY KEY,
-        verificationEnabled BOOLEAN DEFAULT 1,
-        verificationRoleName TEXT DEFAULT 'Citizen',
-        verificationTimeout INTEGER DEFAULT 86400000,
-        verificationMessage TEXT DEFAULT 'Please paste this code into your Roblox About Me to verify yourself.',
-        verificationCodeLength INTEGER DEFAULT 6,
-        allowUsernameVerification BOOLEAN DEFAULT 1,
-        logChannelId TEXT DEFAULT NULL,
-        antiSpamEnabled BOOLEAN DEFAULT 1,
-        verificationFailedMessage TEXT DEFAULT '❌ Verification failed. Please check your code.',
-        verificationSuccessMessage TEXT DEFAULT '🎉 You are now verified!',
-        exemptRoles TEXT DEFAULT 'admin, moderator'
-      );
-    `);
+    // Check and fix table schema if needed
+    db.serialize(() => {
+      // Check if the table exists and if columns are correct
+      db.all("PRAGMA table_info(usedCodes);", (err, rows) => {
+        if (err) {
+          console.error("❌ Error getting table info:", err);
+          return;
+        }
+
+        // If the table is missing or doesn't have 'robloxId', recreate it
+        if (!rows.length || !rows.some(row => row.name === 'robloxId')) {
+          console.log('❌ Invalid table structure. Recreating the table...');
+          db.run('DROP TABLE IF EXISTS usedCodes');
+          db.run('CREATE TABLE usedCodes (code TEXT PRIMARY KEY, robloxId TEXT)', (err) => {
+            if (err) {
+              console.error('❌ Error creating usedCodes table:', err);
+            } else {
+              console.log('✅ usedCodes table recreated with the correct schema.');
+            }
+          });
+        } else {
+          console.log('✅ usedCodes table is valid.');
+        }
+      });
+    });
   }
+});
+
+const express = require('express');
+const app = express();
+const port = 3000;
+
+app.get('/', (req, res) => {
+  res.send('Bot is running!');
+});
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`Server running at http://0.0.0.0:${port}`);
 });
 
 const client = new Client({
@@ -40,182 +59,167 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// Helper function to get settings for a guild
-function getSettings(guildId, callback) {
-  db.get('SELECT * FROM serverSettings WHERE guildId = ?', [guildId], (err, row) => {
-    if (err) {
-      console.error('❌ Error retrieving settings:', err);
-      return callback(null);
-    }
-    return callback(row || {});
-  });
+const pendingVerifications = new Map(); // userId => { robloxId, code }
+
+let verificationEnabled = true; // Default state of verification
+
+function generateCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// Helper function to update settings for a guild
-function updateSettings(guildId, newSettings, callback) {
-  const { verificationEnabled, verificationRoleName, verificationTimeout, verificationMessage, verificationCodeLength,
-          allowUsernameVerification, logChannelId, antiSpamEnabled, verificationFailedMessage, verificationSuccessMessage,
-          exemptRoles } = newSettings;
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
 
-  db.run(
-    `INSERT INTO serverSettings (guildId, verificationEnabled, verificationRoleName, verificationTimeout, verificationMessage, 
-      verificationCodeLength, allowUsernameVerification, logChannelId, antiSpamEnabled, verificationFailedMessage, 
-      verificationSuccessMessage, exemptRoles)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(guildId) 
-     DO UPDATE SET
-     verificationEnabled = ?, verificationRoleName = ?, verificationTimeout = ?, verificationMessage = ?, 
-     verificationCodeLength = ?, allowUsernameVerification = ?, logChannelId = ?, antiSpamEnabled = ?, 
-     verificationFailedMessage = ?, verificationSuccessMessage = ?, exemptRoles = ?`,
-    [guildId, verificationEnabled, verificationRoleName, verificationTimeout, verificationMessage, verificationCodeLength,
-     allowUsernameVerification, logChannelId, antiSpamEnabled, verificationFailedMessage, verificationSuccessMessage, exemptRoles,
-     verificationEnabled, verificationRoleName, verificationTimeout, verificationMessage, verificationCodeLength,
-     allowUsernameVerification, logChannelId, antiSpamEnabled, verificationFailedMessage, verificationSuccessMessage, exemptRoles],
-    (err) => {
-      if (err) {
-        console.error('❌ Error updating settings:', err);
-        return callback(false);
-      }
-      return callback(true);
-    }
-  );
-}
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  if (!guild) {
+    console.error("❌ Guild not found. Check your GUILD_ID in the .env file.");
+    process.exit(1);
+  }
 
-// Command handler
+  console.log(`📌 Connected to guild: ${guild.name}`);
+});
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const args = message.content.trim().split(/\s+/);
   const command = args[0].toLowerCase();
 
-  // Step 1: View current settings
-  if (command === '!settings' && message.member.permissions.has('ADMINISTRATOR')) {
-    getSettings(message.guild.id, (settings) => {
+  // Step 1: !verify <username>
+  if (command === '!verify') {
+    if (!verificationEnabled) {
+      return message.reply('❌ Verification is currently disabled.');
+    }
+
+    const robloxUsername = args[1];
+    if (!robloxUsername) {
+      return message.reply('❗ Please provide your Roblox username. Usage: `!verify <username>`');
+    }
+
+    try {
+      const res = await axios.post('https://users.roblox.com/v1/usernames/users', {
+        usernames: [robloxUsername],
+        excludeBannedUsers: true
+      });
+
+      const userData = res.data.data[0];
+      if (!userData) return message.reply('❌ Roblox user not found.');
+
+      const robloxId = userData.id;
+      const robloxProfileUrl = `https://www.roblox.com/users/${robloxId}/profile`;
+      const profileImageUrl = `https://www.roblox.com/headshot-thumbnail/image?userId=${robloxId}&width=420&height=420&format=png`;
+      const code = generateCode();
+
+      pendingVerifications.set(message.author.id, { robloxId, code });
+
+      // Send instructions with rich embed and profile image
       const embed = new EmbedBuilder()
-        .setTitle('Server Settings')
-        .setDescription(`
-          **Verification Enabled:** ${settings.verificationEnabled ? 'Enabled' : 'Disabled'}
-          **Verification Role:** ${settings.verificationRoleName}
-          **Verification Timeout:** ${settings.verificationTimeout / 1000 / 60 / 60} hours
-          **Verification Code Length:** ${settings.verificationCodeLength} characters
-          **Allow Username Verification:** ${settings.allowUsernameVerification ? 'Enabled' : 'Disabled'}
-          **Anti-Spam:** ${settings.antiSpamEnabled ? 'Enabled' : 'Disabled'}
-          **Log Channel ID:** ${settings.logChannelId ? settings.logChannelId : 'Not set'}
-        `)
-        .setColor('#4CAF50');
+        .setTitle('Roblox Verification')
+        .setDescription(`✅ **Paste this code into your Roblox About Me:**\n\`\`\`${code}\`\`\`\nThen type \`!confirm\` when you're done.`)
+        .setColor('Green')
+        .setThumbnail(profileImageUrl)
+        .setURL(robloxProfileUrl);
 
-      message.reply({ embeds: [embed] });
-    });
-  }
+      return message.reply({ embeds: [embed] });
 
-  // Step 2: Update verification settings
-  if (command === '!setvermessage' && message.member.permissions.has('ADMINISTRATOR')) {
-    const newMessage = args.slice(1).join(' ');
-    if (!newMessage) {
-      return message.reply('❗ Please provide a verification message.');
+    } catch (error) {
+      console.error(error);
+      return message.reply('❌ Failed to fetch Roblox user info.');
     }
-
-    getSettings(message.guild.id, (settings) => {
-      settings.verificationMessage = newMessage;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Verification message updated to: ${newMessage}`);
-        } else {
-          message.reply('❌ Failed to update verification message.');
-        }
-      });
-    });
   }
 
-  // Enable/Disable Anti-Spam
-  if (command === '!toggleantispam' && message.member.permissions.has('ADMINISTRATOR')) {
-    getSettings(message.guild.id, (settings) => {
-      settings.antiSpamEnabled = settings.antiSpamEnabled ? 0 : 1;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Anti-spam has been ${settings.antiSpamEnabled ? 'enabled' : 'disabled'}.`);
-        } else {
-          message.reply('❌ Failed to update anti-spam setting.');
-        }
-      });
-    });
+  // Step 2: !confirm
+  if (command === '!confirm') {
+    const entry = pendingVerifications.get(message.author.id);
+    if (!entry) return message.reply('❗ You need to use `!verify <username>` first.');
+
+    try {
+      const profile = await axios.get(`https://users.roblox.com/v1/users/${entry.robloxId}`);
+      const description = profile.data.description || '';
+
+      // Check if the verification code exists in the About Me
+      if (description.includes(entry.code)) {
+        // Check if the code has already been used in the database
+        db.get('SELECT * FROM usedCodes WHERE code = ? AND robloxId = ?', [entry.code, entry.robloxId], (err, row) => {
+          if (err) {
+            console.error('❌ DB lookup error:', err);
+            return message.reply('❌ Error checking code in the database.');
+          }
+
+          if (row) {
+            return message.reply('❌ This code has already been used or is invalid.');
+          }
+
+          // Add the code to the usedCodes table to prevent reuse
+          db.run('INSERT INTO usedCodes (code, robloxId) VALUES (?, ?)', [entry.code, entry.robloxId], (err) => {
+            if (err) {
+              console.error('❌ DB insert error:', err);
+              return message.reply('❌ Error storing code in the database.');
+            }
+
+            // Assign the "Citizen" role
+            const guild = message.guild;
+            const role = guild.roles.cache.find(r => r.name.toLowerCase() === 'citizen');
+
+            if (!role) {
+              return message.reply('❌ The "Citizen" role does not exist in the server. Please create it.');
+            }
+
+            const member = guild.members.cache.get(message.author.id);
+            if (!member) {
+              return message.reply('❌ Failed to find your Discord account in the server.');
+            }
+
+            member.roles.add(role)
+              .then(() => {
+                pendingVerifications.delete(message.author.id); // Invalidate the code
+                message.reply('🎉 You are now verified and have been given the **Citizen** role!');
+              })
+              .catch((err) => {
+                console.error(err);
+                message.reply('❌ Failed to assign role.');
+              });
+          });
+        });
+      } else {
+        return message.reply('❌ Verification code not found in your profile. Double-check your About Me.');
+      }
+    } catch (err) {
+      console.error('❌ Error while checking your Roblox profile:', err);
+      return message.reply('❌ Error while checking your Roblox profile.');
+    }
   }
 
-  // Set Verification Role Name
+  // Admin Commands
+  if (command === '!settings' && message.member.permissions.has('ADMINISTRATOR')) {
+    // Display current settings
+    const embed = new EmbedBuilder()
+      .setTitle('Verification Settings')
+      .setDescription(`**Verification Enabled:** ${verificationEnabled ? 'Enabled' : 'Disabled'}`)
+      .setColor('Blue');
+
+    message.reply({ embeds: [embed] });
+  }
+
+  // Admin Command to Disable/Enable Verification
+  if (command === '!disableverification' && message.member.permissions.has('ADMINISTRATOR')) {
+    verificationEnabled = !verificationEnabled;
+    message.reply(`✅ Verification has been ${verificationEnabled ? 'enabled' : 'disabled'}.`);
+  }
+
+  // Admin Command to Set Verification Role
   if (command === '!setverrole' && message.member.permissions.has('ADMINISTRATOR')) {
-    const newRoleName = args.slice(1).join(' ');
-    if (!newRoleName) {
-      return message.reply('❗ Please provide a role name.');
-    }
+    const roleName = args.slice(1).join(' ');
+    if (!roleName) return message.reply('❗ Please provide the role name.');
 
-    getSettings(message.guild.id, (settings) => {
-      settings.verificationRoleName = newRoleName;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Verification role name updated to: ${newRoleName}`);
-        } else {
-          message.reply('❌ Failed to update verification role name.');
-        }
-      });
-    });
+    const guild = message.guild;
+    const role = guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+
+    if (!role) return message.reply('❌ The specified role does not exist.');
+
+    // Optionally, save this role for future use (not implemented here)
+    message.reply(`✅ Verification role set to **${roleName}**.`);
   }
-
-  // Set Custom Error Messages
-  if (command === '!setverfailmessage' && message.member.permissions.has('ADMINISTRATOR')) {
-    const newFailMessage = args.slice(1).join(' ');
-    if (!newFailMessage) {
-      return message.reply('❗ Please provide a failure message.');
-    }
-
-    getSettings(message.guild.id, (settings) => {
-      settings.verificationFailedMessage = newFailMessage;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Verification failure message updated.`);
-        } else {
-          message.reply('❌ Failed to update failure message.');
-        }
-      });
-    });
-  }
-
-  if (command === '!setversuccessmessage' && message.member.permissions.has('ADMINISTRATOR')) {
-    const newSuccessMessage = args.slice(1).join(' ');
-    if (!newSuccessMessage) {
-      return message.reply('❗ Please provide a success message.');
-    }
-
-    getSettings(message.guild.id, (settings) => {
-      settings.verificationSuccessMessage = newSuccessMessage;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Verification success message updated.`);
-        } else {
-          message.reply('❌ Failed to update success message.');
-        }
-      });
-    });
-  }
-
-  // Enable/Disable Verification
-  if (command === '!toggleverification' && message.member.permissions.has('ADMINISTRATOR')) {
-    getSettings(message.guild.id, (settings) => {
-      settings.verificationEnabled = settings.verificationEnabled ? 0 : 1;
-      updateSettings(message.guild.id, settings, (success) => {
-        if (success) {
-          message.reply(`✅ Verification system has been ${settings.verificationEnabled ? 'enabled' : 'disabled'}.`);
-        } else {
-          message.reply('❌ Failed to update verification setting.');
-        }
-      });
-    });
-  }
-
-  // Additional settings can be added similarly, such as setting timeout or role exemption.
-});
-
-client.once('ready', () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
 client.login(process.env.DISCORD_TOKEN);
