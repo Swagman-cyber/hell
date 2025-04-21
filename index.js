@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, MessageAttachment } = require('discord.js');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 
