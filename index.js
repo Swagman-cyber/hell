@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, MessageAttachment } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 
@@ -10,7 +10,6 @@ const db = new sqlite3.Database('./usedCodes.db', (err) => {
     process.exit(1);
   } else {
     console.log('Database connected');
-
     // Check and fix table schema if needed
     db.serialize(() => {
       // Check if the table exists and if columns are correct
@@ -101,13 +100,22 @@ client.on('messageCreate', async (message) => {
       if (!userData) return message.reply('❌ Roblox user not found.');
 
       const robloxId = userData.id;
+      const robloxProfileUrl = `https://www.roblox.com/users/${robloxId}/profile`;
+      const profileImageUrl = `https://www.roblox.com/headshot-thumbnail/image?userId=${robloxId}&width=420&height=420&format=png`;
       const code = generateCode();
 
       pendingVerifications.set(message.author.id, { robloxId, code });
 
-      return message.reply(
-        `✅ Paste this code into your **Roblox About Me**:\n\`\`\`${code}\`\`\`\nThen type \`!confirm\` when you're done.`
-      );
+      // Send instructions with rich embed and profile image
+      const embed = new EmbedBuilder()
+        .setTitle('Roblox Verification')
+        .setDescription(`✅ **Paste this code into your Roblox About Me:**\n\`\`\`${code}\`\`\`\nThen type \`!confirm\` when you're done.`)
+        .setColor('Green')
+        .setThumbnail(profileImageUrl)
+        .setURL(robloxProfileUrl);
+
+      return message.reply({ embeds: [embed] });
+
     } catch (error) {
       console.error(error);
       return message.reply('❌ Failed to fetch Roblox user info.');
@@ -122,7 +130,6 @@ client.on('messageCreate', async (message) => {
     try {
       const profile = await axios.get(`https://users.roblox.com/v1/users/${entry.robloxId}`);
       const description = profile.data.description || '';
-      const robloxImage = `https://www.roblox.com/headshot-thumbnail/image?userId=${entry.robloxId}&width=420&height=420&format=png`;
 
       // Check if the verification code exists in the About Me
       if (description.includes(entry.code)) {
@@ -160,17 +167,7 @@ client.on('messageCreate', async (message) => {
             member.roles.add(role)
               .then(() => {
                 pendingVerifications.delete(message.author.id); // Invalidate the code
-                message.reply({
-                  content: `🎉 You are now verified and have been given the **Citizen** role!`,
-                  embeds: [
-                    {
-                      title: `Roblox Profile`,
-                      description: `Welcome to the Kingdom! You're now verified as a **Citizen**.`,
-                      image: { url: robloxImage },
-                      color: 0x00ff00
-                    }
-                  ]
-                });
+                message.reply('🎉 You are now verified and have been given the **Citizen** role!');
               })
               .catch((err) => {
                 console.error(err);
